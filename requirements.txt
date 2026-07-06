@@ -1,0 +1,131 @@
+# ============================================
+# RAG Pipeline - Python Dependencies
+# ENHANCED VERSION with Hybrid Search, Reranking, Dashboard
+# ============================================
+# --------------------------------------------
+# Airflow Core
+# --------------------------------------------
+apache-airflow==2.8.1
+apache-airflow-providers-redis==3.5.0
+apache-airflow-providers-postgres==5.10.0
+apache-airflow-providers-amazon==8.16.0
+# --------------------------------------------
+# Vector Database
+# --------------------------------------------
+qdrant-client==1.7.0
+# --------------------------------------------
+# gRPC — pin both to avoid backtracking
+# qdrant-client needs >=1.41.0; 1.62.x has wheels on
+# all platforms.
+# --------------------------------------------
+grpcio==1.62.3
+grpcio-tools==1.62.3
+# --------------------------------------------
+# Protobuf — MUST stay <5. Verified directly against PyPI
+# metadata (audited 2026-07): grpcio-tools==1.62.3 requires
+# protobuf<5.0,>=4.21.6; mlflow==2.14.3 requires protobuf<5,
+# >=3.12.0; streamlit==1.30.0 requires protobuf<5,>=3.20.
+# ALL THREE cap protobuf below 5 — nothing in this file
+# actually needs protobuf>=5. A previous pin of
+# protobuf>=5.26.1,<6.0.0 was based on an incorrect assumption
+# and made the whole dependency set unsatisfiable (uv correctly
+# refused to resolve it: "grpcio-tools==1.62.3 depends on
+# protobuf>=4.21.6,<5.0.dev0 ... your requirements are
+# unsatisfiable"). The apache/airflow base image already ships
+# protobuf==4.25.2, which satisfies every constraint above with
+# zero extra installs — do not raise this above <5 unless you
+# also bump grpcio/grpcio-tools to >=1.63.0 (the first release
+# where their protobuf floor moved to >=5.26.1) AND confirm
+# mlflow/streamlit have been upgraded to versions that also
+# allow protobuf>=5.
+# --------------------------------------------
+protobuf>=4.25,<5
+# --------------------------------------------
+# Embeddings & LLMs
+# --------------------------------------------
+#openai==1.10.0
+tiktoken==0.5.2
+sentence-transformers==2.3.1
+
+# transformers is a transitive dependency of sentence-transformers, but
+# left unpinned pip resolves to whatever is newest at build time. A newer
+# transformers release is what caused the
+# "NotImplementedError: Cannot copy out of meta tensor" crash in an earlier
+# build (newer releases default to lazy meta-device weight loading). Pinning
+# to a version from the same era as sentence-transformers==2.3.1 avoids
+# that regression recurring on future rebuilds.
+transformers==4.37.2
+
+# NOTE: torch is intentionally NOT listed here — it is installed as a
+# separate CPU-only step in the Dockerfile, before this file is processed,
+# specifically to avoid pip resolving the CUDA/GPU build (see Dockerfile
+# for the full explanation). If torch is ever added to this file directly,
+# pin it to the exact CPU wheel version installed in the Dockerfile
+# (currently torch==2.2.0) or the two will conflict.
+# --------------------------------------------
+# Text Processing
+# --------------------------------------------
+langchain==0.1.4
+langchain-community==0.0.16
+
+# langchain==0.1.4 only constrains langchain-core to "<0.2,>=0.1.16" and
+# langsmith to "<0.1,>=0.0.83" — both open ranges. Left unpinned, pip has
+# to try dozens of langchain-core releases (observed: backtracking from
+# 0.1.53 down to 0.1.23 in a previous build, triggering pip's "This is
+# taking longer than usual" warning and adding minutes to every build).
+# Pinning to the versions pip already settled on removes that resolver
+# work entirely.
+langchain-core==0.1.23
+langsmith==0.0.87
+
+pypdf==3.17.4
+beautifulsoup4==4.12.3
+lxml==5.1.0
+markdownify==0.11.6
+# --------------------------------------------
+# Hybrid Search
+# --------------------------------------------
+rank-bm25==0.2.2
+# --------------------------------------------
+# HTTP & Web
+# --------------------------------------------
+requests==2.31.0
+aiohttp==3.9.1
+# --------------------------------------------
+# Database Drivers
+# --------------------------------------------
+psycopg2-binary==2.9.9
+redis==4.6.0
+# --------------------------------------------
+# MLOps & Monitoring
+# --------------------------------------------
+mlflow==2.14.3
+prometheus-client==0.19.0
+# --------------------------------------------
+# Machine Learning
+# --------------------------------------------
+scikit-learn==1.4.0
+numpy==1.26.3
+# --------------------------------------------
+# Dashboard
+# --------------------------------------------
+streamlit==1.30.0
+# --------------------------------------------
+# Utilities
+# --------------------------------------------
+python-dotenv==1.0.0
+pydantic==2.5.3
+tenacity==8.2.3
+# --------------------------------------------
+# AWS SDK (Optional)
+# --------------------------------------------
+boto3==1.34.20
+botocore==1.34.20
+# --------------------------------------------
+# Testing
+# --------------------------------------------
+pytest==7.4.4
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+setuptools>=65.0.0
+groq==0.9.0

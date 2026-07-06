@@ -1,0 +1,236 @@
+"""
+Upsert vectors to Qdrant vector database.
+ENHANCED: Now includes document expiration metadata.
+"""
+
+import logging
+import os
+from typing import Dict, Any
+import time
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+)
+from qdrant_client.http.exceptions import UnexpectedResponse
+import uuid
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+
+def _get_qdrant_client() -> QdrantClient:
+    """Get Qdrant client connection."""
+    host = os.getenv('QDRANT_HOST', 'localhost')
+    port = int(os.getenv('QDRANT_PORT', 6333))
+    
+    return QdrantClient(host=host, port=port)
+
+
+def _ensure_collection(
+    client: QdrantClient,
+    collection_name: str,
+    vector_dimension: int,
+) -> None:
+    """Ensure collection exists, create if not."""
+    try:
+        client.get_collection(collection_name)
+        logger.info(f"Collection '{collection_name}' already exists")
+    except (UnexpectedResponse, Exception):
+        logger.info(f"Creating collection '{collection_name}' with dimension {vector_dimension}")
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(
+                size=vector_dimension,
+                distance=Distance.COSINE,
+            ),
+        )
+
+
+def upsert_to_qdrant(
+    embedded_chunks: Any,
+    collection_name: str = "knowledge_base_staging",
+    batch_size: int = 100,
+    expiration_days: int = 365,  # NEW: Default 1 year expiration
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Upsert embedded chunks to Qdrant vector database.
+    
+    ENHANCED: Now adds expiration metadata for document lifecycle management.
+    
+    Args:
+        embedded_chunks: List of chunk dictionaries with embeddings
+        collection_name: Qdrant collection name
+        batch_size: Number of points to upsert per batch
+        expiration_days: Days until document expires (0 = never)
+        
+    Returns:
+        Summary statistics
+    """
+    # Handle XCom input
+    if isinstance(embedded_chunks, str):
+        try:
+            import ast
+            embedded_chunks = ast.literal_eval(embedded_chunks)
+        except Exception as e:
+            logger.error(f"Could not parse embedded_chunks from XCom: {e}")
+            return {'success': False, 'points_upserted': 0}
+    
+    if not embedded_chunks:
+        logger.warning("No embedded chunks to upsert")
+        return {'success': False, 'points_upserted': 0}
+    
+    # Parse expiration_days if string
+    if isinstance(expiration_days, str):
+        expiration_days = int(expiration_days)
+    
+    logger.info(f"Starting upsert of {len(embedded_chunks)} chunks to collection '{collection_name}'")
+    logger.info(f"Document expiration: {expiration_days} days (0 = never)")
+    
+    client = _get_qdrant_client()
+    start_time = time.time()
+    
+    # Get vector dimension from first chunk
+    vector_dim = embedded_chunks[0].get('embedding_dimension', 1536)
+    
+    # Ensure collection exists
+    _ensure_collection(client, collection_name, vector_dim)
+    
+    # Calculate expiration timestamp
+    if expiration_days > 0:
+        expires_at = datetime.now() + timedelta(days=expiration_days)
+        expires_at_iso = expires_at.isoformat()
+    else:
+        expires_at_iso = None  # Never expires
+    
+    # Prepare points for upsert
+    points = []
+    for chunk in embedded_chunks:
+        point_id = str(uuid.uuid4())
+        
+        point = PointStruct(
+            id=point_id,
+            vector=chunk['embedding'],
+            payload={
+                'text': chunk['text'],
+                'source': chunk['source'],
+                'source_uri': chunk['source_uri'],
+                'filename': chunk['filename'],
+                'content_hash': chunk.get('content_hash', ''),
+                'chunk_index': chunk['chunk_index'],
+                'total_chunks': chunk['total_chunks'],
+                'embedding_model': chunk['embedding_model'],
+                'metadata': chunk.get('metadata', {}),
+                'ingestion_timestamp': kwargs.get('ts', datetime.now().isoformat()),
+                'expires_at': expires_at_iso,  # NEW: Expiration timestamp
+            }
+        )
+        points.append(point)
+    
+    # Upsert in batches — track which source chunks actually succeeded
+    # (not just a count) so Phase 2 hash confirmation below only confirms
+    # documents whose chunks really landed in Qdrant, even if some batches
+    # fail partway through.
+    points_upserted   = 0
+    succeeded_chunks  = []
+    for i in range(0, len(points), batch_size):
+        batch       = points[i:i + batch_size]
+        chunk_batch = embedded_chunks[i:i + batch_size]
+        
+        try:
+            client.upsert(
+                collection_name=collection_name,
+                points=batch,
+            )
+            points_upserted += len(batch)
+            succeeded_chunks.extend(chunk_batch)
+            logger.debug(f"Upserted batch {i//batch_size + 1}/{(len(points)-1)//batch_size + 1}")
+        
+        except Exception as e:
+            logger.error(f"Error upserting batch starting at index {i}: {e}")
+            continue
+    
+    elapsed_time = time.time() - start_time
+    
+    logger.info(
+        f"Upsert complete: {points_upserted} points in {elapsed_time:.2f}s "
+        f"({points_upserted/elapsed_time:.2f} points/sec)"
+    )
+    
+    # Get collection info
+    try:
+        collection_info = client.get_collection(collection_name)
+        total_points = collection_info.points_count
+        logger.info(f"Collection '{collection_name}' now contains {total_points} total points")
+    except Exception as e:
+        logger.error(f"Error getting collection info: {e}")
+        total_points = points_upserted
+    
+    # Export metrics
+    from utils.metrics_exporter import export_counter, export_histogram, export_gauge
+    export_counter('vectors_upserted_total', points_upserted)
+    export_histogram('upsert_latency_seconds', elapsed_time)
+    export_gauge('collection_total_points', total_points)
+
+    # ── PHASE 2 — confirm document hashes in Redis ──────────────────────────
+    # This is the write half of the two-phase dedup design (see hash_store.py
+    # and deduplicate.py docstrings). deduplicate.py only ever READS
+    # document_hash_exists() — it never writes. The write happens here,
+    # and ONLY for documents whose chunks actually made it into Qdrant in
+    # this batch, so a crash earlier in the pipeline never causes a
+    # "ghost duplicate" that gets skipped forever.
+    if points_upserted > 0:
+        try:
+            from utils.hash_store import confirm_document_hash
+
+            # A single source document can produce many chunks; confirm
+            # each unique content_hash once, not once per chunk. Only
+            # chunks whose batch actually succeeded are considered.
+            confirmed_hashes = set()
+            for chunk in succeeded_chunks:
+                content_hash = chunk.get('content_hash')
+                if not content_hash or content_hash in confirmed_hashes:
+                    continue
+                confirm_document_hash(
+                    content_hash=content_hash,
+                    metadata={
+                        'filename':   chunk.get('filename', ''),
+                        'source':     chunk.get('source', ''),
+                        'source_uri': chunk.get('source_uri', ''),
+                        'confirmed_at': datetime.now().isoformat(),
+                    },
+                )
+                confirmed_hashes.add(content_hash)
+            if confirmed_hashes:
+                logger.info(
+                    f"Confirmed {len(confirmed_hashes)} document hashes in Redis "
+                    f"after successful upsert"
+                )
+        except Exception as e:
+            # Non-fatal: dedup working correctly next run is nice-to-have,
+            # not a reason to fail an otherwise-successful upsert.
+            logger.warning(f"Could not confirm document hashes in Redis: {e}")
+
+    # Invalidate the Streamlit app's Redis-cached BM25 chunk list and any
+    # cached LLM answers for this collection — it just changed, so both
+    # are now stale.
+    if points_upserted > 0:
+        try:
+            from utils.chunk_cache import invalidate_chunk_cache
+            from utils.answer_cache import invalidate_answer_cache
+            invalidate_chunk_cache(collection_name)   # also calls invalidate_bm25_cache
+            invalidate_answer_cache(collection_name)
+        except Exception as e:
+            logger.warning(f"Could not invalidate caches for '{collection_name}': {e}")
+    
+    return {
+        'success': True,
+        'points_upserted': points_upserted,
+        'collection_name': collection_name,
+        'total_points': total_points,
+        'elapsed_time': elapsed_time,
+        'expiration_days': expiration_days,
+        'expires_at': expires_at_iso,
+    }

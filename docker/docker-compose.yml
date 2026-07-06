@@ -1,0 +1,354 @@
+name: rag-pipeline
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ONE IMAGE — built once as "rag-pipeline:latest", shared by all 4 custom
+# services (webserver, scheduler, init, streamlit).
+#
+# Before: docker images showed 4 × 11 GB = 44 GB "virtual"
+# After:  docker images shows 1 × 11 GB
+#
+# Note: Docker already de-duplicates identical layers on disk, so the REAL
+# disk saving is not 33 GB — layers were shared before too.  The gains are:
+#   ✅ `docker images` shows ONE entry instead of four
+#   ✅ `docker compose build` runs exactly once (guaranteed, not just cached)
+#   ✅ No risk of services running from slightly different image versions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+x-rag-image: &rag-image
+  image: rag-pipeline:latest          # all 4 services share this single tag
+  pull_policy: never  
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Airflow defaults — inherited by webserver / scheduler / init / streamlit
+# ───────────────────────────────────────────────────────────────────────────────
+x-airflow-common: &airflow-common
+  <<: *rag-image                      # pulls in image + build from above
+  env_file:
+    - ../.env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    PYTHONPATH: /opt/airflow/dags
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    QDRANT_HOST: qdrant
+    QDRANT_PORT: 6333
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    PROMETHEUS_PUSHGATEWAY: http://prometheus-pushgateway:9091
+    # S3 optional
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    # Free HuggingFace embeddings — no OpenAI key needed
+    RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    # Metadata DB
+    RAG_METADATA_DB_HOST: postgres
+    RAG_METADATA_DB_PORT: 5432
+    RAG_METADATA_DB_NAME: rag_metadata
+    RAG_METADATA_DB_USER: airflow
+    RAG_METADATA_DB_PASSWORD: airflow
+  volumes:
+    - ../dags:/opt/airflow/dags
+    - ../data:/opt/airflow/data
+    - ../logs:/opt/airflow/logs
+    - ../plugins:/opt/airflow/plugins
+    - airflow-worker-logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+    qdrant:
+      condition: service_healthy
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Services
+# ───────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ─── Infrastructure (external images, unchanged) ────────────────────────────
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7.2-alpine
+    # Disable RDB snapshots and AOF so Redis always starts with an empty
+    # database. Without this, pickled BM25 indexes and chunk-list caches
+    # survive container restarts and can crash on deserialization if library
+    # versions changed between restarts — forcing the manual FLUSHDB the user
+    # was running before every restart. Ephemeral Redis is correct here: all
+    # caches self-heal on the first pipeline run (prepare_search_cache) or
+    # first search (fallback scroll + build).
+    command: redis-server --save "" --appendonly no
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  qdrant:
+    image: qdrant/qdrant:v1.7.4
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    healthcheck:
+      # curl is not installed in qdrant; use bash tcp probe instead
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' 2>/dev/null && echo ok || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: always
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.2
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://airflow:airflow@postgres/mlflow
+      MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    command: >
+      bash -c "pip install --no-cache-dir psycopg2-binary==2.9.9 &&
+      mlflow server
+      --backend-store-uri postgresql://airflow:airflow@postgres/mlflow
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully  # wait for mlflow DB to be created
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:v2.48.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    restart: always
+
+  prometheus-pushgateway:
+    image: prom/pushgateway:v1.6.2
+    ports:
+      - "9091:9091"
+    command:
+      # Persist metrics to disk so data survives container restarts.
+      # Without this, the pushgateway keeps everything in memory and
+      # every docker compose restart wipes all pushed metrics, which is
+      # why Grafana shows "No data" after any stack restart.
+      - '--persistence.file=/pushgateway/metrics'
+      - '--persistence.interval=1m'
+    volumes:
+      - pushgateway-data:/pushgateway
+    restart: always
+
+  grafana:
+    image: grafana/grafana:10.2.3
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: ''
+      # NOTE: deliberately NOT setting GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH.
+      # That setting loads a dashboard directly from a file path, bypassing
+      # Grafana's normal database-backed dashboard registration. The frontend
+      # still automatically fires an annotations query for the dashboard's
+      # UID on every page load — but since the backend never registered that
+      # UID (it was loaded from disk, not the DB), that query fails with
+      # "Invalid dashboard UID in annotation request". The dashboard is
+      # already reachable normally via the file provisioner below
+      # (dashboards.yml -> /etc/grafana/dashboards), which DOES register it
+      # properly in Grafana's DB — just navigate to Dashboards > RAG.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      # Named volume MUST come first so the subsequent bind mounts are applied
+      # on top of it and are not shadowed. Previously grafana-data:/var/lib/grafana
+      # was last — in Linux mount namespaces the last mount at a parent path
+      # shadows earlier mounts at child paths, hiding the dashboard JSON files.
+      - grafana-data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning
+      # Dashboards live at /etc/grafana/dashboards — completely outside
+      # /var/lib/grafana so there is zero overlap with the named volume.
+      - ../monitoring/grafana/dashboards:/etc/grafana/dashboards
+    depends_on:
+      - prometheus
+    restart: always
+
+  # ─── RAG application — all 4 containers run from rag-pipeline:latest ────────
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/{logs,dags,plugins}
+
+        echo ">>> Creating mlflow + rag_metadata databases..."
+        PYTHONPATH=/home/airflow/.local/lib/python3.11/site-packages python3 - << 'PYEOF'
+        import psycopg2, sys, time
+
+        for attempt in range(10):
+            try:
+                conn = psycopg2.connect(
+                    host="postgres", user="airflow",
+                    password="airflow", dbname="airflow"
+                )
+                break
+            except psycopg2.OperationalError:
+                print(f"  waiting for postgres... ({attempt+1}/10)")
+                time.sleep(3)
+        else:
+            print("ERROR: could not connect to postgres after 10 attempts")
+            sys.exit(1)
+
+        conn.autocommit = True
+        cur = conn.cursor()
+        for db in ("mlflow", "rag_metadata"):
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db,))
+            if not cur.fetchone():
+                cur.execute(f"CREATE DATABASE {db}")
+                print(f"  created database: {db}")
+            else:
+                print(f"  already exists:   {db}")
+        cur.close()
+        conn.close()
+
+        conn2 = psycopg2.connect(
+            host="postgres", user="airflow",
+            password="airflow", dbname="rag_metadata"
+        )
+        conn2.autocommit = True
+        cur2 = conn2.cursor()
+        with open("/sources/sql/init.sql") as f:
+            cur2.execute(f.read())
+        cur2.close()
+        conn2.close()
+        print("  rag_metadata schema: OK")
+        PYEOF
+
+        echo ">>> Handing off to Airflow entrypoint..."
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    user: "0:0"
+    volumes:
+      - ../:/sources
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started   # init doesn't query qdrant, just needs it up
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Streamlit: same image — entrypoint cleared so "streamlit" is not wrapped
+  # by the Airflow entrypoint script as "airflow streamlit" (which would crash)
+  streamlit:
+    <<: *airflow-common
+    entrypoint: [""]                  # ← override Airflow entrypoint
+    command: >
+      streamlit run /opt/airflow/streamlit_app/app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:                          # override: only what streamlit needs
+      - ../streamlit_app:/opt/airflow/streamlit_app
+      - ../dags:/opt/airflow/dags
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: always
+
+volumes:
+  postgres-db-volume:
+  redis-data:
+  qdrant-storage:
+  mlflow-artifacts:
+  prometheus-data:
+  grafana-data:
+  pushgateway-data:
+  airflow-worker-logs:
