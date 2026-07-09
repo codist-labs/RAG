@@ -135,7 +135,15 @@ services:
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.10.2
     ports:
-      - "5000:5000"
+      # Host port remapped from 5000 -> 5001. Port 5000 is claimed by
+      # macOS's built-in AirPlay Receiver (System Settings > General >
+      # AirDrop & Handoff), which either blocks Docker from binding it or
+      # intercepts connections to it — this is what produces "Access to
+      # localhost was denied" in the browser, not an MLflow/Docker bug.
+      # The container's internal port stays 5000; MLFLOW_TRACKING_URI and
+      # mlflow_logger.py both address MLflow via http://mlflow:5000 on the
+      # internal Docker network, which is unaffected by this remap.
+      - "5001:5000"
     environment:
       MLFLOW_BACKEND_STORE_URI: postgresql://airflow:airflow@postgres/mlflow
       MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts

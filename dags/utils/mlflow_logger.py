@@ -46,7 +46,18 @@ def log_pipeline_metrics(eval_results, chunks_created, docs_processed, **kwargs)
         mlflow.log_metric("documents_processed", docs_processed)
         mlflow.log_metric("chunks_created", chunks_created)
 
-        if eval_results:
+        # `eval_results` can be a genuine evaluation result OR a soft-failure
+        # dict like {'success': False, 'error': 'No benchmark queries'} when
+        # run_retrieval_evaluation couldn't find data/benchmark_queries.json.
+        # That dict is truthy (non-empty), so a naive `if eval_results:`
+        # followed by `.get('recall@1', 0)` silently logs every retrieval
+        # metric as 0 — making "evaluation never ran" indistinguishable from
+        # "the RAG system genuinely scored 0% recall". Check `success`
+        # explicitly so the two cases are never confused in MLflow/Grafana.
+        eval_ran = bool(eval_results) and eval_results.get("success", False)
+        mlflow.log_metric("eval_ran", 1 if eval_ran else 0)
+
+        if eval_ran:
             mlflow.log_metric("recall_at_1",   eval_results.get("recall@1", 0))
             mlflow.log_metric("recall_at_5",   eval_results.get("recall@5", 0))
             mlflow.log_metric("recall_at_10",  eval_results.get("recall@10", 0))
@@ -54,6 +65,18 @@ def log_pipeline_metrics(eval_results, chunks_created, docs_processed, **kwargs)
             mlflow.log_metric(
                 "avg_query_latency_ms",
                 eval_results.get("avg_query_latency_ms", 0),
+            )
+        else:
+            reason = (
+                eval_results.get("error", "unknown")
+                if isinstance(eval_results, dict) else "no eval_results"
+            )
+            mlflow.set_tag("eval_skipped_reason", reason)
+            logger.warning(
+                f"Retrieval evaluation did not produce a real result "
+                f"(reason: {reason}) — recall/mrr/latency metrics were NOT "
+                f"logged this run, to avoid recording misleading zeros. "
+                f"Check that data/benchmark_queries.json exists."
             )
 
         mlflow.set_tag("pipeline", "rag_refresh")
