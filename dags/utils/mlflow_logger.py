@@ -102,3 +102,5 @@ def log_config_params(chunk_size: int, chunk_overlap: int, embedding_model: str)
         logger.info("Logged config parameters to MLflow")
     except Exception as e:
         logger.error(f"Error logging config to MLflow: {e}")
+
+###
